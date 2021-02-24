@@ -2,8 +2,6 @@
 
 ## 单机模式启动server
 
-官方文档很坑所以记录一下
-
 ### 下载
 
 https://github.com/alibaba/nacos/releases/tag/1.2.1
@@ -66,7 +64,7 @@ http://localhost:8848/nacos/index.html
 
 这里测试配置中心只需要用到demoa
 
-###添加配置
+### 添加配置
 
 ```yml
 spring:
@@ -114,7 +112,7 @@ public class ConfigController {
 
 使用@Value即可获取配置中心的配置。加@RefreshScope实现热更新。
 
-#### 注
+#### 注：
 
 1. 本来以为项目启动时本地的配置会自动上传到server端，事实证明我想多了。配置文件需要通过api或者在web控制台手动创建，或者在web控制台直接上传文件
 2. 如果本地和server端配置了同一个参数，会优先使用server上的
@@ -158,7 +156,7 @@ spring:
 
 其实只要配置集群中任何一个节点就行了，注册信息会自动同步到其他节点。但是万一那个节点刚好挂了呢，所以最好全部节点都配上。
 
-####注
+#### 注：
 
 还看到有一种部署方式，是在client的server-addr中配置nginx的地址，然后nginx再将注册请求负载均衡到nacos集群的各个节点。
 
@@ -209,7 +207,7 @@ spring:
         namespace: 51f2c2e0-97e7-4959-afc6-8d4eeb8651d8
 ```
 
-####坑
+#### 坑
 
 config相关配置必须配置在bootstrap中，discovery可以配置在application中
 
@@ -221,11 +219,15 @@ config相关配置必须配置在bootstrap中，discovery可以配置在applicat
 
 可以看到permissions表里resource字段中保存的是`e99e2d98-ee60-4d26-b8bd-0946c4d7f742:*:*`，我猜测这个结构的意思是namespace:group:file，以后版本应该会将权限细分到文件
 
-### server节点动态扩容
+### server节点动态扩展
 
-有个server节点更新线程（ServerListUpdater）每5s读取一次cluster.conf，更新server节点列表，并遍历ServerChangeListener通知。因此**server节点支持动态扩容**。
+使用Linux的inotify机制监听cluster.conf文件的变动，自动触发server节点列表更新，并发布MembersChangeEvent，因此**server节点支持动态扩容扩展**。
 
-##配置中心深入理解
+具体代码在`FileConfigMemberLookup::readClusterConfFromDisk`中。
+
+> 注：这里改过了，1.2版本还是定时任务每隔5s读取文件的
+
+## 配置中心深入理解
 
 ### 配置文件本地缓存
 
@@ -233,13 +235,13 @@ client会在本地缓存配置文件，路径为`用户目录/nacos/config`。�
 
 ### 配置文件更新过程
 
-####client端轮询
+#### client端轮询
 
 client每30s，将本地缓存的groupKey以及md5发送到server，server会计算本地配置文件的md5并对比，返回md5不一致的配置文件的key。然后client再挨个key发送请求去下载最新配置文件。
 
 这个定时30s不是在client端控制的，而是在server端。client端会循环发送请求到server端对比md5，server端每次收到请求后先对比一次md5，不一致就立即返回不一致的配置文件的key，一致的话就挂起29.5s以后再对比一次，以此达到一种类似定时任务的效果。
 
-#####不多bb直接上源码：
+##### 不多bb直接上源码：
 
 ```java
 // 客户端轮询更新配置的线程
@@ -473,7 +475,7 @@ if (isFixedPolling()) {
 
 在web控制台上修改配置文件以后，请求发送到任意一个server节点，节点会保存配置到数据库中的config_info表中，然后发送请求通知所有server（**包括自己**，因为web上修改配置的请求只修改了数据库，没有更新本地缓存），将数据库中的最新配置信息，更新到本地的缓存文件中。
 
-####被通知方
+#### 被通知方
 
 TaskManager中while轮询任务列表，server节点收到通知后就往任务列表中添加任务就行了。server节点更新本地缓存时，会发布LocalDataChangeEvent事件，这个事件会**被上一节中的LongPollingService捕获**。
 
@@ -681,7 +683,7 @@ spring:
             refresh: true
 ```
 
-####shared-configs
+#### shared-configs
 
 同一个命名空间下，可以共享配置文件。refresh默认是false，说明共享配置文件默认是**不会热更新**的。
 
@@ -695,15 +697,33 @@ demoa-dev.properties > demoa.properties > extension > shared
 
 ## 注册中心深入理解
 
-### 临时实例
+### 持久化实例和临时实例
 
-web端服务详情里可以看到，默认注册上去的服务是**临时实例**。临时实例和持久化实例，两者有什么区别？如何注册持久化实例？
+服务注册请求中有一个参数ephemeral，表示是否注册为临时实例，默认为true，可以通过如下方式配置为持久化注册：
 
-目前看来client端无法控制注册方式，自动注册只能注册为临时实例。猜测注册持久化实例可能需要手动发送注册请求。
+```yaml
+spring:
+  cloud:
+    nacos:
+      discovery:
+        ephemeral: false
+```
+
+#### 区别
+
++ 临时实例的健康状态监控通过客户端心跳（http）实现，而持久化实例是通过服务端心跳（tcp）实现，具体见<u>健康状态</u>
+
++ 服务端中临时实例保存在内存中（ConcurrentHashMap）；持久化实例保存在本地文件系统中（raft协议）
+
++ 持久化实例注册到服务端以后，会使用raft协议（1.4.2版本还在用，但是已经标记为deprecated）保证数据一致性，因此持久化注册模式下是CP的；临时实例注册后，使用nacos自己实现的Distro协议保证一致性，具体见<u>Distro协议</u>，这个协议是AP的
++ 貌似持久化实例和临时实例可以一起使用的，一个服务下可以既有持久化实例又有临时实例（根据Cluster对象可以看出），也就是说nacos是AP和CP混合的（不确定，很奇怪）
++ 猜测：临时实例应该是用来应对双十一这种突然流量暴增的场景，日常稳定使用的话应该都是持久化实例，方便运维。但是！eureka只支持临时注册却依然很流行，是否又说明持久化注册没必要？好像只有CP的注册中心才支持持久化注册？
 
 ### 健康状态
 
-web端服务详情里可以看到每个服务的健康状态，根据心跳超时时间判断。默认每5s发送一次心跳，15s未收到心跳则将状态置为不健康，30s未收到心跳则从注册表中移除。心跳间隔和超时时间可通过如下配置自定义：
+#### 临时实例
+
+临时实例根据**客户端心跳（Http）**更新实例状态：默认每5s发送一次心跳，15s未收到心跳则将状态置为不健康，30s未收到心跳则从注册表中移除该实例。心跳可通过如下配置自定义：
 
 ```yml
 spring:
@@ -715,173 +735,350 @@ spring:
         ip-delete-timeout: 30
 ```
 
-+ 如果server端收到心跳请求后，发现这个实例已经不在注册表中了，则会**重新注册**这个实例。因为可能是网络故障导致server一直收不到心跳，然后server以为这个节点挂了就移除了，然后网络恢复后又能够收到心跳了，所以要重新注册。
-+ 每个service都有一个定时线程（ClientBeatCheckTask.java），每隔5s扫描一次这个service下的所有instance，然后根据心跳时间更新实例的健康状态，以及移除死亡（三次心跳没收到）实例。移除死亡实例其实就是往本地的删除实例的接口发个请求。
+注：如果server端收到心跳请求后，发现这个实例已经不在注册表中了，则会自动重新注册这个实例。因为可能是网络故障导致server一直收不到心跳，然后server以为这个节点挂了就移除了，然后网络恢复后又能够收到心跳了。
 
-### client请求随机发送
-
-client往server发送的请求（如注册，心跳等等），都是随机选取server节点的。如果发送失败，会选择其他server重发，直到把所有server节点都发一遍。
-
-serverList就是从配置的server-addr读取的，所以如果配nginx的话在client看来算只有一个server。但是不等于单机模式，是否是单机是在服务端记录的，客户端不管。
+服务端每个服务的Service对象初始化时，都会创建一个线程，每隔5s扫描一次这个服务下的所有实例，然后根据最后心跳时间更新实例的状态：
 
 ```java
-/**
- * client发送请求都是调用这个接口。NamingProxy.java
- * @param servers 所有server节点的列表
- */
-public String reqAPI(String api, Map<String, String> params, String body, List<String> servers, String method) throws NacosException {
-		...
-    if (servers != null && !servers.isEmpty()) {
-        // 从serverList中随机选取一个节点
-        Random random = new Random(System.currentTimeMillis());
-        int index = random.nextInt(servers.size());
-        for (int i = 0; i < servers.size(); i++) {
-            String server = servers.get(index);
-            try {
-                // 发送请求
-                return callServer(api, params, body, server, method);
-            } catch (NacosException e) {
-                ...
+// 服务端的状态检查线程
+public class ClientBeatCheckTask implements Runnable {
+  	// 每个服务都有一个线程
+    private Service service;
+  
+    @Override
+    public void run() {
+        try {
+          	// 如果不是自己负责的service就不管。这里是distro协议，下面会讲
+            if (!getDistroMapper().responsible(service.getName())) {
+                return;
             }
-            // 如果发送失败，再往下一个节点重发，直到所有节点都发一遍
-            index = (index + 1) % servers.size();
+						// 这个true表示只获取临时实例
+            List<Instance> instances = service.allIPs(true);
+            // 判断是否超过15s，超过标记为不健康
+            for (Instance instance : instances) {
+                if (System.currentTimeMillis() - instance.getLastBeat() > instance.getInstanceHeartBeatTimeOut()) {
+                  	// 实例中的这个mark不知道是什么作用，只知道mark以后服务状态就不会变了
+                    if (!instance.isMarked()) {
+                        if (instance.isHealthy()) {
+                            instance.setHealthy(false);
+                          	// 发布ServiceChangeEvent和InstanceHeartbeatTimeoutEvent
+                            getPushService().serviceChanged(service);
+                            ApplicationUtils.publishEvent(new InstanceHeartbeatTimeoutEvent(this, instance));
+                        }
+                    }
+                }
+            }
+            
+            // 判断是否超过30s，超过就从注册表移除
+            for (Instance instance : instances) {
+                if (instance.isMarked()) {
+                    continue;
+                }
+                if (System.currentTimeMillis() - instance.getLastBeat() > instance.getIpDeleteTimeout()) {
+                    deleteIp(instance);
+                }
+            }
         }
     }
-
-		// 当serverList.size()==1时，nacosDomain=serverList。这边再重发一次，因为size=1时上面不会循环
-    if (StringUtils.isNotBlank(nacosDomain)) {
-        for (int i = 0; i < UtilAndComs.REQUEST_DOMAIN_RETRY_COUNT; i++) {
-            try {
-                return callServer(api, params, body, nacosDomain, method);
-            } catch (NacosException e) {
-                ...
-            }
-        }
-    }
-    ...
 }
 ```
 
-### @CanDistro
+#### 持久化实例
 
-server端有些controller接口上有@CanDistro注解，比如服务注册请求，心跳请求等等。这个注解会被DistroFilter过滤器处理，过滤器中会判断一下这个请求是否由自己负责，如果加了注解但是不是由自己负责，就转发给负责该服务的server节点来处理。对于每个服务，负责处理该服务的server节点是固定的（为什么这么设计？？？）
+持久化实例根据**服务端心跳（Tcp）**更新实例状态。
+
+服务端的Service对象初始化时，还会初始化Service下所有的集群Cluster对象（一个服务下可以有多个集群）。每个Cluster对象初始化时会创建一个线程，每隔 2 + random(0, random(0, 5)) 秒向客户端发送心跳，连续3次发送失败就会将实例置为不健康，但是**不会删除实例**。
 
 ```java
+// 集群健康检查线程
+public class HealthCheckTask implements Runnable {
+		// 每个集群一个线程
+    private Cluster cluster;
+    @JsonIgnore
+    private final DistroMapper distroMapper;
+		// 这个心跳接口有三个实现类，分别是Http、Tcp、Mysql，默认是Tcp
+    @JsonIgnore
+    private final HealthCheckProcessor healthCheckProcessor;
+
+    @Override
+    public void run() {
+        try {
+          	// 依然是distro协议，如果不是自己负责的服务就不管
+            if (distroMapper.responsible(cluster.getService().getName()) && switchDomain.isHealthCheckEnabled(cluster.getService().getName())) {
+              	// 执行，具体见下方
+                healthCheckProcessor.process(this);
+            }
+        } catch (Throwable e) {
+        } finally {
+            if (!cancelled) {
+              	// 套娃，循环执行自己，间隔2+(0, (0, 5))s
+                HealthCheckReactor.scheduleCheck(this);
+              	this.setCheckRtLastLast(this.getCheckRtLast());
+            }
+        }
+    }
+}
+```
+
+```java
+// 这个就是Tcp心跳实现类，另外还实现了Runnable接口
+public class TcpSuperSenseProcessor implements HealthCheckProcessor, Runnable {
+    public static final String TYPE = "TCP";
+    private Map<String, BeatKey> keyMap = new ConcurrentHashMap<>();
+    private BlockingQueue<Beat> taskQueue = new LinkedBlockingQueue<Beat>();
+		// 使用java nio
+    private Selector selector;
+    private static final long TCP_KEEP_ALIVE_MILLIS = 0;
+		
+  	// 上面定时调用的方法，将心跳放入队列中然后就返回了
+    @Override
+    public void process(HealthCheckTask task) {
+        // false表示只获取持久化实例
+        List<Instance> ips = task.getCluster().allIPs(false);
+        for (Instance ip : ips) {
+            if (ip.isMarked()) {
+                continue;
+            }
+						// 创建心跳对象并放入心跳队列中
+            Beat beat = new Beat(ip, task);
+            taskQueue.add(beat);
+            MetricsMonitor.getTcpHealthCheckMonitor().incrementAndGet();
+        }
+    }
+
+  	// 自身线程执行的内容，就是不停地扫描心跳队列，真正发送心跳是在这里
+    @Override
+    public void run() {
+        while (true) {
+            try {
+              	// 扫描队列取出心跳，包装成线程执行。这里用的是Future.get()，因此是阻塞的
+                processTask();
+              	// 下面就是nio基本操作了
+                int readyCount = selector.selectNow();
+                if (readyCount <= 0) {
+                    continue;
+                }
+                Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
+                while (iter.hasNext()) {
+                    SelectionKey key = iter.next();
+                    iter.remove();
+                    GlobalExecutor.executeTcpSuperSense(new PostProcessor(key));
+                }
+            } catch (Throwable e) {
+            }
+        }
+    }
+}
+```
+
+```java
+// 对心跳结果的处理在这里，这里只贴了失败的处理方法
+public class HealthCheckCommon {
+  
+  	// 心跳检查失败，更新实例状态
+    public void checkFail(Instance ip, HealthCheckTask task, String msg) {
+        Cluster cluster = task.getCluster();
+        try {
+            if (ip.isHealthy() || ip.isMockValid()) {
+              	// 如果心跳失败次数大于等于3次，就将状态置为不健康
+                if (ip.getFailCount().incrementAndGet() >= switchDomain.getCheckTimes()) {
+                  	// 依然是熟悉的distro协议
+                    if (distroMapper.responsible(cluster, ip)) {
+                        ip.setHealthy(false);
+                        ip.setMockValid(false);
+                        Service service = cluster.getService();
+                        service.setLastModifiedMillis(System.currentTimeMillis());
+                        addResult(new HealthCheckResult(service.getName(), ip));
+                        // 发布ServiceChangeEvent
+                        pushService.serviceChanged(service);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+        }
+        // 重置实例状态
+        ip.getOkCount().set(0);
+        ip.setBeingChecked(false);
+    }
+}
+```
+
+### Distro协议
+
+这个是nacos自己实现的AP协议。
+
+#### 如何保证一致性
+
+临时实例注册到服务端以后，会使用Distro协议同步到其他server节点（放到一个任务队列中，然后另一个线程轮询，最终调用的是NamingProxy::syncData，使用http），并通知实例所属的Service对象更新（发布事件，Service对象本身就是个监听器）。
+
+整个数据同步过程都是异步的，server节点之间是弱一致的。
+
+```java
+// 负责临时实例持久化的类
+public class DistroConsistencyServiceImpl implements EphemeralConsistencyService, DistroDataProcessor {
+	// distro协议主类
+    private final DistroProtocol distroProtocol;
+	// 负责通知Service对象更新，Service对象本身实现了Listener接口
+    private volatile Notifier notifier = new Notifier();
+    // key是服务名，value是Service对象列表
+    private Map<String, ConcurrentLinkedQueue<RecordListener>> listeners = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void init() {
+        // 初始化时启动通知线程
+        GlobalExecutor.submitDistroNotifyTask(notifier);
+    }
+
+    // 添加实例
+    @Override
+    public void put(String key, Record value) throws NacosException {
+        if (!listeners.containsKey(key)) {
+            return;
+        }
+        // 添加实例新增事件到通知队列中
+        notifier.addTask(key, DataOperation.CHANGE);
+        // 同步新注册的实例到其他server节点，1s后执行
+        distroProtocol.sync(new DistroKey(key, KeyBuilder.INSTANCE_LIST_KEY_PREFIX), DataOperation.CHANGE, globalConfig.getTaskDispatchPeriod() / 2);
+    }
+
+    // 移除实例
+    @Override
+    public void remove(String key) throws NacosException {
+        if (!listeners.containsKey(key)) {
+            return;
+        }
+        // 添加实例移除事件到notifier队列中
+        notifier.addTask(key, DataOperation.DELETE);
+        listeners.remove(key);
+    }
+
+    // 通知Service对象更新
+    public class Notifier implements Runnable {
+        // 通知队列
+        private BlockingQueue<Pair<String, DataOperation>> tasks = new ArrayBlockingQueue<>(1024 * 1024);
+
+        public void addTask(String datumKey, DataOperation action) {
+            tasks.offer(Pair.with(datumKey, action));
+        }
+
+        // 不停轮询队列，获取实例事件，并更新实例所属的Service对象
+        @Override
+        public void run() {
+            for (; ; ) {
+                try {
+                    Pair<String, DataOperation> pair = tasks.take();
+                    String datumKey = pair.getValue0();
+                	DataOperation action = pair.getValue1();
+                    if (!listeners.containsKey(datumKey)) {
+                        return;
+                    }
+                    // 遍历listener，listener就是Service对象
+                    for (RecordListener listener : listeners.get(datumKey)) {
+                        try {
+                            // 调用Service对象的回调方法
+                            if (action == DataOperation.CHANGE) {
+                                listener.onChange(datumKey, dataStore.get(datumKey).value);
+                                continue;
+                            }
+                            if (action == DataOperation.DELETE) {
+                                listener.onDelete(datumKey);
+                                continue;
+                            }
+                        } catch (Throwable e) {
+                        }
+                    }
+                } catch (Throwable e) {
+                }
+            }
+        }
+    }
+}
+```
+
+另外，server节点刚启动的时候，会从本地cluster.conf读取所有server节点列表，然后发送请求到其他server节点拉取distro快照（NamingProxy::getAllData），最后解析成注册表放入内存中。如果所有节点的请求都失败，会在30s后重试。这里的代码就不贴了，在DistroProtocol::startLoadTask中。
+
+#### @CanDistro
+
+server端的controller中，有些接口上有`@CanDistro`注解，一般都和`@Secured(action = ActionTypes.WRITE)`一起使用，也就是说涉及到写操作的接口会使用Distro协议，比如服务注册、服务下线、心跳续约。
+
+这个注解会被DistroFilter过滤器处理，过滤器中会判断一下这个service是否由当前server节点负责，如果不是由自己负责的，就转发给负责该服务的server节点来处理。也就是说**每个server节点只处理固定的几个服务的请求。**大概的逻辑就是，将所有server节点排序，计算serviceName哈希值，对server节点列表取模。
+
+```java
+// 请求过滤器
 public class DistroFilter implements Filter {
-
-    private static final int PROXY_CONNECT_TIMEOUT = 2000;
-    private static final int PROXY_READ_TIMEOUT = 2000;
-
     @Autowired
     private DistroMapper distroMapper;
   	// 缓存了所有@RequestMapping注解的方法
     @Autowired
     private ControllerMethodsCache controllerMethodsCache;
-  
-    @Override
-    public void init(FilterConfig filterConfig) throws ServletException {
-    }
 
     @Override
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse, FilterChain filterChain) throws IOException, ServletException {
         HttpServletRequest req = (HttpServletRequest) servletRequest;
         HttpServletResponse resp = (HttpServletResponse) servletResponse;
-        ...
         try {
             String path = new URI(req.getRequestURI()).getPath();
-            ...
             Method method = controllerMethodsCache.getMethod(req.getMethod(), path);
-            ...
-
-            // 加了@CanDistro，但是不负责，就转发给其他节点
+            // 加了@CanDistro，同时又不是自己负责的，那就转发给其他server节点
             if (method.isAnnotationPresent(CanDistro.class) && !distroMapper.responsible(groupedServiceName)) {
                 String userAgent = req.getHeader(HttpHeaderConsts.USER_AGENT_HEADER);
-                ...
-                // 转发请求到其他健康的server节点
+                // 转发请求
                 HttpClient.HttpResult result = HttpClient.request("http://" + distroMapper.mapSrv(groupedServiceName) + req.getRequestURI(), headerList, HttpClient.translateParameterMap(req.getParameterMap()), body, PROXY_CONNECT_TIMEOUT, PROXY_READ_TIMEOUT, Charsets.UTF_8.name(), req.getMethod());
-								...
                 return;
             }
-          
-            // 自己负责处理请求
-            ...
+
+            // 如果是自己负责，就正常执行方法
             filterChain.doFilter(requestWrapper, resp);
         } catch (AccessControlException e) {
-            ...
         }
-    }
-
-    @Override
-    public void destroy() {
     }
 }
 ```
 
 ```java
+// 判断请求是否由当前节点负责
 public class DistroMapper implements ServerChangeListener {
-
+	// 所有健康的server节点列表，包括自己
     private List<String> healthyList = new ArrayList<>();
-
-    @Autowired
-    private SwitchDomain switchDomain;
-    @Autowired
-    private ServerListManager serverListManager;
-
-    @PostConstruct
-    public void init() {
-      	// 把自己添加到server监听列表中
-        serverListManager.listen(this);
-    }
-  	...
-		// 是否负责指定的服务（没搞懂）
+  
+  	// 当前server节点是否负责指定的服务。这里是核心
     public boolean responsible(String serviceName) {
-        // 没开启distro，或者是单机模式，那就负责
-        if (!switchDomain.isDistroEnabled() || SystemUtils.STANDALONE_MODE) {
+        final List<String> servers = healthyList;
+        // 服务端关闭distro，或者是单机模式，那就负责
+        if (!switchDomain.isDistroEnabled() || EnvUtil.getStandaloneMode()) {
             return true;
         }
-				// 没有健康的server节点，不负责
-        if (CollectionUtils.isEmpty(healthyList)) {
+      	// 所有server都不健康，也包括自己，那就不负责
+        if (CollectionUtils.isEmpty(servers)) {
             return false;
         }
-
-        // 这边为什么要前后都找？healthyList的元素是不重复的，index和lastIndex应该是一样的
-        int index = healthyList.indexOf(NetUtils.localServer());
-        int lastIndex = healthyList.lastIndexOf(NetUtils.localServer());
-      	// 本地节点不在健康节点中，为什么要负责？？？？？？？
+      
+        // 这里不明白为什么要前后都查一遍？这么写的意思就是server节点会重复，什么场景下会重复呢？
+        int index = servers.indexOf(EnvUtil.getLocalAddress());
+        int lastIndex = servers.lastIndexOf(EnvUtil.getLocalAddress());
         if (lastIndex < 0 || index < 0) {
             return true;
         }
-				// 判断自己是不是负责这个服务的server
-        int target = distroHash(serviceName) % healthyList.size();
+        // 计算hash值对server列表取模，如果命中当前服务就负责
+        int target = distroHash(serviceName) % servers.size();
         return target >= index && target <= lastIndex;
     }
 
-  	// 获取负责该服务的server节点
+  	// 获取负责该服务的server节点，这个方法在DistroFilter中转发时用到
     public String mapSrv(String serviceName) {
-        ...
         try {
-            // 计算hashCode，然后模健康节点的size取出目标server。healthyList是排序过的，保证所有的server节点取出的同一个服务的目标server一致
+            // 计算hash，对健康节点列表取模。healthyList是排序过的，保证所有server节点这一步操作的结果一直
             return healthyList.get(distroHash(serviceName) % healthyList.size());
         } catch (Exception e) {
-            ...
             return NetUtils.localServer();
         }
     }
-
-    public int distroHash(String serviceName) {
-        return Math.abs(serviceName.hashCode() % Integer.MAX_VALUE);
-    }
-
-    @Override
-    public void onChangeHealthyServerList(List<Server> latestReachableMembers) {
-        List<String> newHealthyList = new ArrayList<>();
-        for (Server server : latestReachableMembers) {
-            newHealthyList.add(server.getKey());
-        }
-        healthyList = newHealthyList;
-    }
 }
 ```
+
+### client请求随机发送
+
+client往server发送的请求（如注册，心跳等等），都是随机选取server节点的。如果发送失败，会选择其他server重发，直到把所有server节点都轮询一遍。
 
 ### 服务注册过程
 
@@ -890,7 +1087,7 @@ client启动时发送注册请求到server的/instance接口，收到请求的se
 ```java
 // ServiceManager.java
 public void registerInstance(String namespaceId, String serviceName, Instance instance) throws NacosException {
-    // 服务不存在就新建服务
+    // 如果这个实例是这个服务下第一个来注册的，那就先新建服务对象
     createEmptyService(namespaceId, serviceName, instance.isEphemeral());
   	// 获取服务对象 
     Service service = getService(namespaceId, serviceName);
@@ -901,16 +1098,17 @@ public void registerInstance(String namespaceId, String serviceName, Instance in
 
 /**
  * Map<namespace, Map<group::serviceName, Service>>
+ * 这个就是注册表了吧
  */
 private Map<String, Map<String, Service>> serviceMap = new ConcurrentHashMap<>();
 
-// 如果服务不存在，新建服务的方法
+// 新建服务对象
 private void putServiceAndInit(Service service) throws NacosException {
     // 放到serviceMap里
     putService(service);
     // 初始化心跳监控定时任务，这个定时任务负责更新实例的健康状态，以及移除过期实例
     service.init();
-    // 注册两个监听器，service对象本身就是监听器，key分别如下：
+    // 为这个服务注册两个监听器，一个是针对临时实例的，一个是针对非临时的，临时的key里面多个.ephemeral，key分别如下：
     // com.alibaba.nacos.naming.iplist.ephemeral.{namespaceId}##{serviceName}
   consistencyService.listen(KeyBuilder.buildInstanceListKey(service.getNamespaceId(), service.getName(), true), service);
     // com.alibaba.nacos.naming.iplist.{namespaceId}##{serviceName}
@@ -985,7 +1183,7 @@ public class TaskScheduler implements Runnable {
 }
 ```
 
-### server健康检查
+### 服务端健康检查
 
 server节点之间也会有类似于心跳的机制，用于同步节点间的状态信息，每个server节点中会缓存一个健康的server节点列表，用于distro协议转发请求等等。
 
